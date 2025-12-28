@@ -10,8 +10,8 @@
 
 // Firmware title and version used to compare with remote version, to check if an update is needed.
 // Title needs to be the same and version needs to be different --> downgrading is possible
-constexpr char CURRENT_FIRMWARE_TITLE[] = "TEST";
-constexpr char CURRENT_FIRMWARE_VERSION[] = "2.0.0";
+constexpr char CURRENT_FIRMWARE_TITLE[] = "CORE_ESP32";
+constexpr char CURRENT_FIRMWARE_VERSION[] = "1.0.1";
 
 // Maximum amount of retries we attempt to download each firmware chunck over MQTT
 constexpr uint8_t FIRMWARE_FAILURE_RETRIES = 12U;
@@ -25,7 +25,7 @@ constexpr char wifiPassword[] = WIFI_PASSWORD;
 constexpr char token[] = TB_TOKEN;
 
 // Thingsboard server configuration
-constexpr char THINGSBOARD_SERVER[] = "thingsboard.cloud";
+constexpr char THINGSBOARD_SERVER[] = "192.168.1.83";
 constexpr uint16_t THINGSBOARD_PORT = 1883U;
 
 // Maximum size packets will ever be sent or received by the underlying MQTT client,
@@ -35,6 +35,10 @@ constexpr uint16_t MAX_MESSAGE_RECEIVE_SIZE = 512U;
 
 // Baud rate for the debugging serial connection
 constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
+
+// Telemetry sending interval (milliseconds)
+constexpr uint32_t telemetrySendInterval = 5000U;
+uint32_t previousDataSend = 0;
 
 // Initialize ESP32 WiFi client
 WiFiClient espClient;
@@ -50,6 +54,7 @@ Espressif_Updater<> updater;
 // Statuses for updating
 bool currentFWSent = false;
 bool updateRequestSent = false;
+
 
 // Initializes WiFi connection
 void InitWiFi() {
@@ -102,26 +107,11 @@ void setup() {
   Serial.printf("Version: %s\n", CURRENT_FIRMWARE_VERSION);
   Serial.println("========================================");
   
-  // Initialize random number generator for temperature simulation
-  randomSeed(analogRead(0));
-  
   InitWiFi();
 }
 
 void loop() {
   delay(1000);
-
-  // Send temperature telemetry every 10 seconds
-  static uint32_t lastTelemetry = 0;
-  if (millis() - lastTelemetry > 10000) {
-    float temperature = 15.0 + (random(0, 2000) / 100.0);
-    
-    Serial.printf("[TELEMETRY] Temperature: %.2f°C (Firmware: %s v%s)\n", 
-                  temperature, CURRENT_FIRMWARE_TITLE, CURRENT_FIRMWARE_VERSION);
-    tb.sendTelemetryData("temperature", temperature);
-    
-    lastTelemetry = millis();
-  }
 
   if (!reconnect()) {
     return;
@@ -142,7 +132,6 @@ void loop() {
     }
   }
 
-  
   // Check for updates
   if (!updateRequestSent) {
     Serial.println("[OTA] Checking for firmware updates...");
@@ -154,6 +143,18 @@ void loop() {
     } else {
       Serial.println("[OTA] No update available or same version detected");
     }
+  }
+
+  // Sending telemetry every telemetrySendInterval time
+  if (millis() - previousDataSend > telemetrySendInterval) {
+    previousDataSend = millis();
+    tb.sendTelemetryData("humidity", random(10, 20));
+    tb.sendAttributeData("rssi", WiFi.RSSI());
+    tb.sendAttributeData("channel", WiFi.channel());
+    tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
+    tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
+    tb.sendAttributeData("ssid", WiFi.SSID().c_str());
+    Serial.println("[TELEMETRY] Data sent to ThingsBoard");
   }
 
   tb.loop();

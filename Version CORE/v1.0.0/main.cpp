@@ -1,281 +1,160 @@
-// ================== LIBRARIES ==================
+// ESP32 Libraries
 #include <WiFi.h>
 #include <Arduino_MQTT_Client.h>
 #include <OTA_Firmware_Update.h>
 #include <ThingsBoard.h>
 #include <Espressif_Updater.h>
-#include <Wire.h>
-#include <U8g2lib.h>
+
 // Configuration files
 #include "credentials.h"
-// ================== HELTEC V3 PINS ==================
-#define SDA_OLED 17
-#define SCL_OLED 18
-#define RST_OLED 21
-#define Vext     36
 
-// ================== OLED ==================
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(
-  U8G2_R0, RST_OLED, SCL_OLED, SDA_OLED
-);
+// Firmware title and version used to compare with remote version, to check if an update is needed.
+// Title needs to be the same and version needs to be different --> downgrading is possible
+constexpr char CURRENT_FIRMWARE_TITLE[] = "CORE_ESP32";
+constexpr char CURRENT_FIRMWARE_VERSION[] = "1.0.0";
 
-// ================== FIRMWARE ==================
-constexpr char FW_TITLE[]   = "CORE";
-constexpr char FW_VERSION[] = "1.0.0";
+// Maximum amount of retries we attempt to download each firmware chunck over MQTT
+constexpr uint8_t FIRMWARE_FAILURE_RETRIES = 12U;
 
-// ================== OTA ==================
-constexpr uint8_t  OTA_RETRIES = 12;
-constexpr uint16_t OTA_PACKET_SIZE = 16384;
-constexpr uint32_t OTA_CHECK_TIMEOUT = 5000;
+// Size of each firmware chunck downloaded over MQTT,
+// increased packet size, might increase download speed
+constexpr uint16_t FIRMWARE_PACKET_SIZE = 16384U;
 
-// ================== WIFI ==================
 constexpr char wifiSSID[] = WIFI_SSID;
 constexpr char wifiPassword[] = WIFI_PASSWORD;
-
-// ================== THINGSBOARD ==================
 constexpr char token[] = TB_TOKEN;
-constexpr char TB_HOST[] = "thingsboard.cloud";
-constexpr uint16_t TB_PORT = 1883;
 
-// ================== SYSTEM ==================
-constexpr uint32_t SERIAL_BAUD = 115200;
-constexpr uint32_t TELEMETRY_INTERVAL = 10000;
-constexpr uint32_t SCREEN_INTERVAL = 2000;
+// Thingsboard server configuration
+constexpr char THINGSBOARD_SERVER[] = "192.168.1.83";
+constexpr uint16_t THINGSBOARD_PORT = 1883U;
 
-// ================== LOGS ==================
-#define LOGI(x) Serial.println(String("[INFO] ") + x)
-#define LOGW(x) Serial.println(String("[WARN] ") + x)
-#define LOGE(x) Serial.println(String("[ERROR] ") + x)
+// Maximum size packets will ever be sent or received by the underlying MQTT client,
+// if the size is to small messages might not be sent or received messages will be discarded
+constexpr uint16_t MAX_MESSAGE_SEND_SIZE = 512U;
+constexpr uint16_t MAX_MESSAGE_RECEIVE_SIZE = 512U;
 
-// ================== CLIENTS ==================
+// Baud rate for the debugging serial connection
+constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
+
+// Telemetry sending interval (milliseconds)
+constexpr uint32_t telemetrySendInterval = 5000U;
+uint32_t previousDataSend = 0;
+
+// Initialize ESP32 WiFi client
 WiFiClient espClient;
+// Initialize MQTT client and ThingsBoard
 Arduino_MQTT_Client mqttClient(espClient);
 OTA_Firmware_Update<> ota;
+const std::array<IAPI_Implementation*, 1U> apis = { &ota };
+ThingsBoard tb(mqttClient, MAX_MESSAGE_RECEIVE_SIZE, MAX_MESSAGE_SEND_SIZE, apis);
+
+// Initialize ESP32 Updater for OTA
 Espressif_Updater<> updater;
-const std::array<IAPI_Implementation*, 1> apis = { &ota };
-ThingsBoard tb(mqttClient, 512, 512, apis);
 
-// ================== SCREEN STATE ==================
-enum ScreenState {
-  SCREEN_BOOT,
-  SCREEN_OTA_CHECK,
-  SCREEN_OTA_PROGRESS,
-  SCREEN_RUN
-};
+// Statuses for updating
+bool currentFWSent = false;
+bool updateRequestSent = false;
 
-ScreenState currentScreen = SCREEN_BOOT;
 
-// ================== STATE ==================
-bool fwInfoSent = false;
-bool otaRequested = false;
-bool otaInProgress = false;
-bool otaDone = false;
-
-uint32_t otaCheckStart = 0;
-
-size_t otaProgress = 0;
-size_t otaTotal = 0;
-
-float lastCurrent = 0.0;
-float lastVoltage = 0.0;
-
-uint32_t lastTelemetry = 0;
-uint32_t lastScreen = 0;
-
-// ================== POWER ==================
-inline void VextON()  { pinMode(Vext, OUTPUT); digitalWrite(Vext, LOW); }
-inline void VextOFF() { pinMode(Vext, OUTPUT); digitalWrite(Vext, HIGH); }
-
-// ================== UI HELPERS ==================
-void drawHeader(const char* title) {
-  u8g2.setFont(u8g2_font_5x7_tf);
-  u8g2.drawStr(2, 9, title);
-  if (WiFi.isConnected()) u8g2.drawStr(90, 9, "WiFi");
-  if (tb.connected())     u8g2.drawStr(112, 9, "TB");
-  u8g2.drawHLine(0, 12, 128);
-}
-
-void drawFooter() {
-  u8g2.setFont(u8g2_font_5x7_tf);
-
-  char fw[18];
-  snprintf(fw, sizeof(fw), "FW v%s", FW_VERSION);
-  u8g2.drawStr(2, 62, fw);
-
-  u8g2.drawStr(88, 62, tb.connected() ? "ONLINE" : "OFFLINE");
-}
-
-// ================== SCREENS ==================
-void showBoot() {
-  u8g2.clearBuffer();
-  drawHeader("BOOT");
-
-  u8g2.setFont(u8g2_font_ncenB10_tr);
-  u8g2.drawStr(28, 34, "MIRUTEC");
-
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(20, 52, "Initializing...");
-
-  u8g2.sendBuffer();
-}
-
-void showCheckingOTA() {
-  u8g2.clearBuffer();
-  drawHeader("OTA");
-
-  u8g2.setFont(u8g2_font_ncenB10_tr);
-  u8g2.drawStr(16, 34, "CHECKING");
-
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(14, 52, "FIRMWARE...");
-
-  u8g2.sendBuffer();
-}
-
-void showOTAUpdating() {
-  u8g2.clearBuffer();
-  drawHeader("OTA");
-
-  // Title
-  u8g2.setFont(u8g2_font_ncenB10_tr);
-  u8g2.drawStr(18, 26, "UPDATING");
-
-  // Percentage
-  int percent = (otaTotal > 0) ? (otaProgress * 100) / otaTotal : 0;
-  char pStr[10];
-  snprintf(pStr, sizeof(pStr), "%d%%", percent);
-
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(54, 40, pStr);
-
-  // Progress bar
-  const uint8_t barX = 14;
-  const uint8_t barY = 46;
-  const uint8_t barW = 100;
-  const uint8_t barH = 10;
-
-  u8g2.drawFrame(barX, barY, barW, barH);
-
-  uint8_t fillW = (percent * (barW - 2)) / 100;
-  u8g2.drawBox(barX + 1, barY + 1, fillW, barH - 2);
-
-  u8g2.sendBuffer();
-}
-
-void showRunScreen() {
-  u8g2.clearBuffer();
-  drawHeader("RUN");
-
-  char iStr[10];
-  char vStr[10];
-
-  snprintf(iStr, sizeof(iStr), "%.1fA", lastCurrent);
-  snprintf(vStr, sizeof(vStr), "%.0fV", lastVoltage);
-
-  u8g2.setFont(u8g2_font_logisoso18_tr);
-  u8g2.drawStr(6, 42, iStr);
-
-  uint8_t w = u8g2.getStrWidth(vStr);
-  u8g2.drawStr(126 - w, 42, vStr);
-
-  drawFooter();
-  u8g2.sendBuffer();
-}
-
-// ================== OTA CALLBACKS ==================
-void otaStart() {
-  LOGW("OTA started");
-  otaInProgress = true;
-  currentScreen = SCREEN_OTA_PROGRESS;
-}
-
-void otaProgressCb(const size_t& current, const size_t& total) {
-  otaProgress = current;
-  otaTotal = total;
-}
-
-void otaFinish(const bool &success) {
-  if (success) {
-    LOGI("OTA success");
-    otaDone = true;
-  } else {
-    LOGE("OTA failed");
-    otaInProgress = false;
-    currentScreen = SCREEN_RUN;
-  }
-}
-
-// ================== SETUP ==================
-void setup() {
-  Serial.begin(SERIAL_BAUD);
-  VextON();
-  u8g2.begin();
-
-  showBoot();
-
+// Initializes WiFi connection
+void InitWiFi() {
+  Serial.println("Connecting to AP ...");
   WiFi.begin(wifiSSID, wifiPassword);
-  while (WiFi.status() != WL_CONNECTED) delay(100);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("Connected to AP");
 }
 
-// ================== LOOP ==================
-void loop() {
+// Reconnects WiFi if connection is lost
+bool reconnect() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+  InitWiFi();
+  return true;
+}
 
-  if (otaDone) esp_restart();
+// Called when OTA update starts
+void update_starting_callback() {
+  Serial.println("[OTA] Update starting - New firmware version detected!");
+}
+
+// Called when OTA update finishes
+void finished_callback(const bool & success) {
+  if (success) {
+    Serial.println("[OTA] Update completed successfully! Rebooting...");
+    esp_restart();
+    return;
+  }
+  Serial.println("[OTA] Firmware download failed");
+}
+
+// Shows OTA update progress
+void progress_callback(const size_t & current, const size_t & total) {
+  Serial.printf("Progress %.2f%%\n", static_cast<float>(current * 100U) / total);
+}
+
+void setup() {
+  // Initialize serial connection
+  Serial.begin(SERIAL_DEBUG_BAUD);
+  delay(1000);
+  
+  // Show firmware information
+  Serial.println("========================================");
+  Serial.printf("Firmware: %s\n", CURRENT_FIRMWARE_TITLE);
+  Serial.printf("Version: %s\n", CURRENT_FIRMWARE_VERSION);
+  Serial.println("========================================");
+  
+  InitWiFi();
+}
+
+void loop() {
+  delay(1000);
+
+  if (!reconnect()) {
+    return;
+  }
 
   if (!tb.connected()) {
-    tb.connect(TB_HOST, token, TB_PORT);
+    Serial.printf("Connecting to: (%s) with token (%s)\n", THINGSBOARD_SERVER, token);
+    if (!tb.connect(THINGSBOARD_SERVER, token, THINGSBOARD_PORT)) {
+      Serial.println("Failed to connect");
+      return;
+    }
   }
 
-  if (!fwInfoSent) {
-    fwInfoSent = ota.Firmware_Send_Info(FW_TITLE, FW_VERSION);
+  if (!currentFWSent) {
+    currentFWSent = ota.Firmware_Send_Info(CURRENT_FIRMWARE_TITLE, CURRENT_FIRMWARE_VERSION);
+    if (currentFWSent) {
+      Serial.printf("[OTA] Current firmware info sent: %s v%s\n", CURRENT_FIRMWARE_TITLE, CURRENT_FIRMWARE_VERSION);
+    }
   }
 
-  // ---- OTA CHECK ----
-  if (!otaRequested && fwInfoSent) {
-    LOGI("Checking for firmware update...");
-    currentScreen = SCREEN_OTA_CHECK;
-    otaCheckStart = millis();
-
-    OTA_Update_Callback cb(
-      FW_TITLE, FW_VERSION, &updater,
-      otaFinish, otaProgressCb, otaStart,
-      OTA_RETRIES, OTA_PACKET_SIZE
-    );
-
-    otaRequested = ota.Start_Firmware_Update(cb);
+  // Check for updates
+  if (!updateRequestSent) {
+    Serial.println("[OTA] Checking for firmware updates...");
+    const OTA_Update_Callback callback(CURRENT_FIRMWARE_TITLE, CURRENT_FIRMWARE_VERSION, &updater, &finished_callback, &progress_callback, &update_starting_callback, FIRMWARE_FAILURE_RETRIES, FIRMWARE_PACKET_SIZE);
+    updateRequestSent = ota.Start_Firmware_Update(callback);
+    
+    if (updateRequestSent) {
+      Serial.println("[OTA] Update request initiated successfully");
+    } else {
+      Serial.println("[OTA] No update available or same version detected");
+    }
   }
 
-  // ---- OTA TIMEOUT ----
-  if (!otaInProgress &&
-      currentScreen == SCREEN_OTA_CHECK &&
-      millis() - otaCheckStart > OTA_CHECK_TIMEOUT) {
-
-    LOGI("No update available → RUN");
-    currentScreen = SCREEN_RUN;
-  }
-
-  // ---- TELEMETRY ----
-  if (currentScreen == SCREEN_RUN &&
-      millis() - lastTelemetry > TELEMETRY_INTERVAL) {
-
-    lastCurrent = 5.0 + random(0, 800) / 100.0;
-    lastVoltage = 210 + random(0, 200) / 10.0;
-
-    tb.sendTelemetryData("current", lastCurrent);
-    tb.sendTelemetryData("voltage", lastVoltage);
-
-    lastTelemetry = millis();
-  }
-
-  // ---- SCREEN REFRESH ----
-  if (millis() - lastScreen > SCREEN_INTERVAL) {
-
-    if (currentScreen == SCREEN_BOOT) showBoot();
-    else if (currentScreen == SCREEN_OTA_CHECK) showCheckingOTA();
-    else if (currentScreen == SCREEN_OTA_PROGRESS) showOTAUpdating();
-    else showRunScreen();
-
-    lastScreen = millis();
+  // Sending telemetry every telemetrySendInterval time
+  if (millis() - previousDataSend > telemetrySendInterval) {
+    previousDataSend = millis();
+    tb.sendTelemetryData("temperature", random(10, 20));
+    tb.sendAttributeData("rssi", WiFi.RSSI());
+    tb.sendAttributeData("channel", WiFi.channel());
+    tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
+    tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
+    tb.sendAttributeData("ssid", WiFi.SSID().c_str());
+    Serial.println("[TELEMETRY] Data sent to ThingsBoard");
   }
 
   tb.loop();

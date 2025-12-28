@@ -9,6 +9,18 @@ This project demonstrates how to implement remote firmware updates (OTA) through
 - **Version TEST**: Basic implementation to understand OTA functionality
 - **Version CORE**: Complete version with graphical interface on Heltec V3 OLED display
 
+### 💡 Example Use Case: Temperature and Humidity Monitoring
+
+This project includes a practical example of version management where:
+
+- **Version 1.0.0**: Configured to send **temperature** telemetry data to ThingsBoard
+- **Version 1.0.1**: Updated version configured to send **humidity** telemetry data instead
+
+This demonstrates how OTA updates can be used to change device functionality remotely without physical access, perfect for:
+- Switching between different sensor readings
+- Updating device behavior based on deployment needs
+- Testing different telemetry configurations in production environments
+
 ## 🔧 Required Hardware
 
 - **Heltec WiFi LoRa 32 V3** (or compatible ESP32 with OLED display)
@@ -110,6 +122,32 @@ pio run --target upload
   - Simulated telemetry (current and voltage)
   - WiFi and ThingsBoard connectivity indicators
   - Progress bar during OTA update
+
+### 📈 Version History - Practical Example
+
+#### Version 1.0.0 - Temperature Sensor
+- **Telemetry**: Sends temperature data (°C)
+- **Purpose**: Monitor ambient temperature
+- **Data Sent**:
+  ```cpp
+  temperature: 25.4°C  // Simulated or from sensor
+  ```
+- **Use Case**: Temperature monitoring in server rooms, greenhouses, or climate control systems
+
+#### Version 1.0.1 - Humidity Sensor
+- **Telemetry**: Sends humidity data (%)
+- **Purpose**: Monitor relative humidity
+- **Data Sent**:
+  ```cpp
+  humidity: 65.2%  // Simulated or from sensor
+  ```
+- **Use Case**: Humidity monitoring in storage facilities, museums, or agricultural environments
+
+This example demonstrates how a single device can be repurposed through OTA updates:
+- Deploy v1.0.0 to monitor temperature
+- Update to v1.0.1 via ThingsBoard dashboard to switch to humidity monitoring
+- No physical access required - update happens remotely
+- Perfect for testing different sensor configurations or changing requirements
 
 ## 🔄 How OTA Works
 
