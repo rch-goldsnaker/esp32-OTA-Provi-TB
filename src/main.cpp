@@ -4,9 +4,13 @@
 #include <OTA_Firmware_Update.h>
 #include <ThingsBoard.h>
 #include <Espressif_Updater.h>
+#include <Provision.h>
+#include <Preferences.h>
 
 // Configuration files
 #include "credentials.h"
+#include "nvs_manager.h"
+#include "provision_manager.h"
 
 // Firmware title and version used to compare with remote version, to check if an update is needed.
 // Title needs to be the same and version needs to be different --> downgrading is possible
@@ -22,7 +26,13 @@ constexpr uint16_t FIRMWARE_PACKET_SIZE = 16384U;
 
 constexpr char wifiSSID[] = WIFI_SSID;
 constexpr char wifiPassword[] = WIFI_PASSWORD;
-constexpr char token[] = TB_TOKEN;
+
+// Provisioning configuration
+constexpr char provisionDeviceKey[] = PROVISION_DEVICE_KEY;
+constexpr char provisionDeviceSecret[] = PROVISION_DEVICE_SECRET;
+
+// Provisioning timeout
+constexpr uint64_t REQUEST_TIMEOUT_MICROSECONDS = 5000U * 1000U;
 
 // Thingsboard server configuration
 constexpr char THINGSBOARD_SERVER[] = TB_SERVER;
@@ -45,18 +55,28 @@ WiFiClient espClient;
 // Initialize MQTT client and ThingsBoard
 Arduino_MQTT_Client mqttClient(espClient);
 OTA_Firmware_Update<> ota;
-const std::array<IAPI_Implementation*, 1U> apis = { &ota };
+Provision<> prov;
+const std::array<IAPI_Implementation*, 2U> apis = { &ota, &prov };
 ThingsBoard tb(mqttClient, MAX_MESSAGE_RECEIVE_SIZE, MAX_MESSAGE_SEND_SIZE, apis);
 
 // Initialize ESP32 Updater for OTA
 Espressif_Updater<> updater;
 
+// Initialize Preferences for NVS
+Preferences preferences;
+
 // Statuses for updating
 bool currentFWSent = false;
 bool updateRequestSent = false;
 
+// Statuses for provisioning
+bool provisionRequestSent = false;
+bool provisionResponseProcessed = false;
+bool isProvisioned = false;
 
-// Initializes WiFi connection
+// Access token (obtained from provisioning)
+String accessToken = "";
+
 void InitWiFi() {
   Serial.println("Connecting to AP ...");
   WiFi.begin(wifiSSID, wifiPassword);
@@ -108,6 +128,20 @@ void setup() {
   Serial.println("========================================");
   
   InitWiFi();
+  
+  // Try to load token from NVS
+  Serial.println("\n[NVS] Checking for saved token...");
+  isProvisioned = loadTokenFromNVS();
+  
+  if (isProvisioned) {
+    Serial.println("[PROVISION] Already provisioned");
+    provisionResponseProcessed = true;
+  } else {
+    Serial.println("[PROVISION] Not provisioned - will request provisioning");
+  }
+  
+  // Uncomment to force re-provisioning:
+  // clearTokenFromNVS();
 }
 
 void loop() {
@@ -117,12 +151,50 @@ void loop() {
     return;
   }
 
+  // Provisioning Phase
+  if (!provisionResponseProcessed) {
+    if (!provisionRequestSent) {
+      if (!tb.connected()) {
+        Serial.printf("[PROVISION] Connecting to: %s\n", THINGSBOARD_SERVER);
+        if (!tb.connect(THINGSBOARD_SERVER, "provision", THINGSBOARD_PORT)) {
+          Serial.println("[PROVISION] Failed to connect");
+          return;
+        }
+      }
+      
+      Serial.println("[PROVISION] Sending provisioning request...");
+      
+      // Use MAC address as device name
+      std::string device_name = WiFi.macAddress().c_str();
+      Serial.printf("[PROVISION] Device name: %s\n", device_name.c_str());
+      
+      const Provision_Callback provisionCallback(
+        Access_Token(), 
+        &processProvisionResponse, 
+        provisionDeviceKey, 
+        provisionDeviceSecret, 
+        device_name.c_str(), 
+        REQUEST_TIMEOUT_MICROSECONDS, 
+        &requestTimedOut
+      );
+      
+      provisionRequestSent = prov.Provision_Request(provisionCallback);
+    }
+    
+    tb.loop();
+    return; // Don't proceed until provisioning is complete
+  }
+
+  // Normal Operation Phase (After Provisioning)
   if (!tb.connected()) {
-    Serial.printf("Connecting to: (%s) with token (%s)\n", THINGSBOARD_SERVER, token);
-    if (!tb.connect(THINGSBOARD_SERVER, token, THINGSBOARD_PORT)) {
+    Serial.printf("Connecting to: %s\n", THINGSBOARD_SERVER);
+    
+    if (!tb.connect(THINGSBOARD_SERVER, accessToken.c_str(), THINGSBOARD_PORT)) {
       Serial.println("Failed to connect");
       return;
     }
+    
+    Serial.println("Connected to ThingsBoard!");
   }
 
   if (!currentFWSent) {
